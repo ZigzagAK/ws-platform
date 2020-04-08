@@ -1,30 +1,22 @@
-# Web server platform
+/*
+ * Copyright (C) 2020 Aleksei Konovkin (alkon2000@mail.ru)
+ */
 
-Implementing in Rust.
+extern crate web_server;
+extern crate yaml_rust;
 
-Now is in development.
+use web_server::core::*;
+use web_server::http::*;
+use web_server::tcp::tcp::*;
 
-Will be dynamically configurable web development platform. 
+fn main() {
 
-**Main features:**
+    let conf_main = "
+---
+error_log: error.log
+";
 
-- YAML for configuration.
-- Simple extendable with plugins.
-- Scripts support (LUA, Python).
-- Thread pools support.
-- Event loop for IO operations for requests, responses and proxying.
-- Upstreams support.
-- Routing by:
-    * Prefix tree
-    * Method
-    * Regexp
-    * Host
-
-And many other features.
-
-# Configuration
-
-```yaml
+    let conf_http = "
 ---
 http:
   error_log: error.log
@@ -341,258 +333,24 @@ http:
           - route:
               match: /*
               proxy: u1
-```
+";
 
-# Plugins examples
+    CoreModule::configure();
+    CoreModule::config_parse(conf_main).unwrap();
 
-## Index
+    HttpModule::configure();
+    HttpModule::config_parse(conf_http).unwrap();
 
-```rust
-/*
- * Copyright (C) 2020 Aleksei Konovkin (alkon2000@mail.ru)
- */
+    TcpModule::configure();
 
-register_http_plugin!(Index);
+    CoreModule::activate();
+    HttpModule::activate();
+    TcpModule::activate();
 
-use std::thread;
+    // HttpModule::deactivate();
+    // TcpModule::deactivate();
 
-use crate::module::*;
-use crate::plugin::*;
-use crate::http::*;
-
-pub struct Index
-{}
-
-impl Plugin for Index {
-    type ModuleType = HTTP;
-
-    fn configure(&mut self) -> ActionResult {
-        add_command!(Context::ROUTE, "index", |route: &mut RouteContext, root: String| {
-            route.content = Some(ContentHandler::new(move |r| -> HttpResponse {
-                let mut resp = HttpResponse::new(r);
-
-                let uri = format!("{}{}", root, resp.get_request().uri().trim_end_matches("/"));
-                let uri = match std::fs::metadata(&uri) {
-                    Ok(m) => {
-                        if m.is_dir() {
-                            String::from(format!("{}/index.html", &uri))
-                        } else {
-                            uri
-                        }
-                    },
-                    Err(_) => uri
-                };
-
-                let text = format!("[{:?}] {} -> {}", thread::current().id(), resp.get_request().uri(), &uri);
-                log_http_error!(resp.get_request(), "debug", text);
-        
-                let _ = resp.send_file(&uri);
-                resp
-            }));
-
-            Ok(None)
-        })
-    }
+    HttpModule::wait();
+    TcpModule::wait();
+    CoreModule::wait();
 }
-
-impl Index {
-    pub fn new() -> Index {
-        Index {}
-    }
-}
-```
-
-## Echo
-
-```rust
-/*
- * Copyright (C) 2020 Aleksei Konovkin (alkon2000@mail.ru)
- */
-
-register_http_plugin!(Echo);
-
-use crate::plugin::*;
-use crate::config::*;
-use crate::http::*;
-
-#[derive(Default, Clone)]
-pub struct EchoContext {
-    status: Option<HttpStatus>,
-    text: Option<HttpComplexValue>
-}
-
-pub struct Echo
-{}
-
-impl Plugin for Echo {
-    type ModuleType = HTTP;
-
-    fn configure(&mut self) -> ActionResult {
-
-        add_command!(Context::ROUTE, "echo.text", |echo: &mut EchoContext, cv: HttpComplexValue| {
-            echo.text = Some(cv);
-            Ok(None)
-        })?;
-
-        add_command!(Context::ROUTE, "echo.status", |echo: &mut EchoContext, status: i64| {
-            echo.status = Some(HttpStatus::from(status));
-            Ok(None)
-        })?;
-
-        add_block!(Context::ROUTE, "echo", move |context, cv: HttpComplexValue| {
-            match context.get_mut::<EchoContext>() {
-                Some(echo) => {
-                    // exit
-                    let echo = std::mem::take(echo);
-                    context.parent().unwrap()
-                           .get_mut::<RouteContext>().unwrap()
-                           .content = Some(ContentHandler::new(move |r| -> HttpResponse {
-                               let text = r.expand(&echo.text.as_ref().unwrap());
-                               let mut resp = HttpResponse::new(r);
-                               resp.send(echo.status.unwrap_or(HttpStatus::OK),
-                                         "text/plain",
-                                         Some(text.as_bytes()));
-                               resp
-                           }));
-                    Ok(None)
-                },
-                None => {
-                    // enter
-                    let mut echo = EchoContext::default();
-                    echo.text = Some(cv);
-                    Ok(Some(CommandContext::new(echo)))
-                }
-            }
-        })?;
-
-        Ok(OK)
-    }
-}
-
-impl Echo {
-    pub fn new() -> Echo {
-        Echo {}
-    }
-}
-```
-
-## Simple least connection balancer
-
-```rust
-/*
- * Copyright (C) 2020 Aleksei Konovkin (alkon2000@mail.ru)
- */
-
-register_http_plugin!(LeastConn);
-
-use std::collections::hash_map::Iter;
-use std::net::SocketAddr;
-
-use crate::plugin::*;
-use crate::http::http::*;
-use crate::http::plugins::upstream::UpstreamContext;
-use crate::connection_pool::ConnectionPool;
-use crate::upstream::UpstreamBalance;
-
-#[derive(Default)]
-pub struct BalanceLeastConn {}
-
-impl UpstreamBalance for BalanceLeastConn {
-    fn balance(&self, iter: Iter<SocketAddr, ConnectionPool>) -> Option<SocketAddr> {
-        let mut best = (std::usize::MAX, None);
-        for (addr, pool) in iter {
-            let active = pool.active();
-            if active < best.0 {
-                best.0 = active;
-                best.1 = Some(*addr);
-            }
-        }
-        best.1
-    }
-}
-
-pub struct LeastConn {
-}
-
-impl Plugin for LeastConn {
-    type ModuleType = HTTP;
-
-    fn name() -> &'static str {
-        "LeastConn"
-    }
-
-    fn configure(&mut self) -> ActionResult {
-
-        add_command!(Context::UPSTREAM, "least_conn", |upstream: &mut UpstreamContext, enabled: bool| {
-            if enabled {
-                upstream.balancer = Box::new(BalanceLeastConn::default());
-            }
-
-            Ok(None)
-        })
-    }
-}
-
-impl LeastConn {
-    pub fn new() -> LeastConn {
-        LeastConn {}
-    }
-}
-```
-
-## Async JOB
-
-```rust
-/*
- * Copyright (C) 2020 Aleksei Konovkin (alkon2000@mail.ru)
- */
-
-register_http_plugin!(AsyncTask);
-
-use std::{ thread, thread::JoinHandle };
-use std::time::Duration;
-
-use crate::plugin::*;
-use crate::http::http::*;
-use crate::error::Code::*;
-
-pub struct AsyncTask {
-    thr: Option<JoinHandle<()>>
-}
-
-impl Plugin for AsyncTask {
-    type ModuleType = HTTP;
-
-    fn configure(&mut self) -> ActionResult {
-        Ok(OK)
-    }
-
-    fn activate(&mut self) -> ActionResult {
-        self.thr = Some(thread::spawn(|| {
-            for i in 0..10 {
-                println!("{}", i);
-                thread::sleep(Duration::from_millis(100));
-            }
-        }));
-        Ok(OK)
-    }
-
-    fn deactivate(&mut self) -> ActionResult {
-        Ok(DECLINED)
-    }
-
-    fn wait(&mut self) {
-        if let Some(thr) = self.thr.take() {
-            thr.join().unwrap();
-        }
-    }
-}
-
-impl AsyncTask {
-    pub fn new() -> AsyncTask {
-        AsyncTask {
-            thr: None
-        }
-    }
-}
-```
