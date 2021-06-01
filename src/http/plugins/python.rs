@@ -4,7 +4,7 @@
 
 register_http_plugin!(PythonAPI);
 
-use pyo3::{ prelude::*, PyClassShell, types::{ PyDict } };
+use pyo3::{ prelude::*, PyCell, types::{ PyDict } };
 use regex::Regex;
 use std::ops::Deref;
 
@@ -63,7 +63,7 @@ fn exec(modules: &[(String, String)], code: Option<&str>) -> Result<Option<Pytho
         python_throw!(py, err, "import failed");
     })?;
     if let Some(code) = code {
-        let wrap = PyClassShell::new_mut(py, PythonResponseWrapper {
+        let wrap = PyCell::new(py, PythonResponseWrapper {
             response: None
         }).or_else(|err| {
             python_throw!(py, err, "import failed");
@@ -74,7 +74,7 @@ fn exec(modules: &[(String, String)], code: Option<&str>) -> Result<Option<Pytho
         py.run(code, None, Some(dict)).or_else(|err| {
             python_throw!(py, err, "exec failed");
         })?;
-        return Ok(wrap.response.take());
+        return Ok(wrap.borrow_mut().response.take());
     }
     Ok(None)
 }
